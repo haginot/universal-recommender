@@ -122,38 +122,32 @@ object EsClient {
         s"/$indexName",
         Map.empty[String, String].asJava).getStatusLine.getStatusCode match {
           case 404 => {
-            var mappings = """
-            |{
+            var mappings = s"""
+            |{ "mappings": { "$indexType": {
             |  "properties": {
             """.stripMargin.replace("\n", "")
 
             def mappingsField(`type`: String) = {
               s"""
             |    : {
-            |      "type": "${`type`}",
-            |      "norms" : {
-            |        "enabled" : false
-            |      }
+            |      "type": "${`type`}"
             |    },
             """.stripMargin.replace("\n", "")
             }
 
             val mappingsTail = """
             |    "id": {
-            |      "type": "keyword",
-            |      "norms" : {
-            |        "enabled" : false
-            |      }
+            |      "type": "keyword"
             |    }
             |  }
-            |}
+            |}}}
           """.stripMargin.replace("\n", "")
 
             fieldNames.foreach { fieldName =>
               if (typeMappings.contains(fieldName))
-                mappings += (fieldName + mappingsField(typeMappings(fieldName)))
+                mappings += (s""""$fieldName"""" + mappingsField(typeMappings(fieldName)))
               else // unspecified fields are treated as not_analyzed keyword
-                mappings += (fieldName + mappingsField("keyword"))
+                mappings += (s""""$fieldName"""" + mappingsField("keyword"))
             }
             mappings += mappingsTail // any other string is not_analyzed
             val entity = new NStringEntity(mappings, ContentType.APPLICATION_JSON)
@@ -188,10 +182,14 @@ object EsClient {
   /** Commits any pending changes to the index */
   def refreshIndex(indexName: String): Unit = {
     val restClient = client.open()
-    restClient.performRequest(
-      "POST",
-      s"/$indexName/_refresh",
-      Map.empty[String, String].asJava)
+    try {
+      restClient.performRequest(
+        "POST",
+        s"/$indexName/_refresh",
+        Map.empty[String, String].asJava)
+    } finally {
+      restClient.close()
+    }
   }
 
   /** Create new index and hot-swap the new after it's indexed and ready to take over, then delete the old */
@@ -205,7 +203,7 @@ object EsClient {
     val newIndex = alias + "_" + DateTime.now().getMillis.toString
 
     logger.debug(s"Create new index: $newIndex, $typeName, $fieldNames, $typeMappings")
-    createIndex(newIndex, typeName, fieldNames, typeMappings)
+    createIndex(newIndex, typeName, fieldNames, typeMappings, true)
 
     val newIndexURI = "/" + newIndex + "/" + typeName
     // TODO check if {"es.mapping.id": "id"} work on ESHadoop Interface of ESv5
@@ -215,27 +213,34 @@ object EsClient {
     val restClient = client.open()
     try {
       // get index for alias, change a char, create new one with new id and index it, swap alias and delete old one
-      val response = restClient.performRequest(
-        "GET",
-        s"/_alias/$alias",
-        Map.empty[String, String].asJava)
-      val responseJValue = parse(EntityUtils.toString(response.getEntity))
-      // TODO to use keys
-      val oldIndexSet = responseJValue.extract[Map[String, JValue]].keys
-      val deleteOldIndexQuery = oldIndexSet.map(oldIndex => {
-        s"""{ "remove_index": { "index": "${oldIndex}"}}"""
-      }).mkString(",", ",", "")
 
-      val aliasQuery =
-        s"""
-           |{
-           |    "actions" : [
-           |        { "add":  { "index": "${newIndex}", "alias": "${alias}" } }
-        """ + deleteOldIndexQuery +
-          """
-           |    ]
-           |}
-          """.stripMargin.replace("\n", "")
+      val (oldIndexSet, deleteOldIndexQuery) = restClient.performRequest(
+        "HEAD",
+        s"/_alias/$alias",
+        Map.empty[String, String].asJava).getStatusLine.getStatusCode match {
+          case 200 => {
+            val response = restClient.performRequest(
+              "GET",
+              s"/_alias/$alias",
+              Map.empty[String, String].asJava)
+            val responseJValue = parse(EntityUtils.toString(response.getEntity))
+            // TODO to use keys
+            val oldIndexSet = responseJValue.extract[Map[String, JValue]].keys
+            val deleteOldIndexQuery = oldIndexSet.map(oldIndex => {
+              s"""{ "remove_index": { "index": "${oldIndex}"}}"""
+            }).mkString(",", ",", "")
+            (oldIndexSet, deleteOldIndexQuery)
+          }
+          case _ => (Set(), "")
+        }
+
+      val aliasQuery = s"""
+        |{
+        |    "actions" : [
+        |        { "add":  { "index": "${newIndex}", "alias": "${alias}" } }
+        |        ${deleteOldIndexQuery}
+        |    ]
+        |}""".stripMargin.replace("\n", "")
       val entity = new NStringEntity(aliasQuery, ContentType.APPLICATION_JSON)
       if (!oldIndexSet.isEmpty) {
         restClient.performRequest(
